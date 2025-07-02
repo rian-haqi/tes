@@ -173,8 +173,129 @@ def place_buy_order(symbol, quantity, min_notional):
         print(f"Terjadi error umum saat membeli: {e}")
         return 0
 
+def convert_coin_to_usdt(from_asset, quantity):
+    """Mengkonversi koin ke USDT menggunakan berbagai metode."""
+    try:
+        print(f"💱 Mencoba CONVERT {quantity} {from_asset} → USDT...")
+        
+        # Method 1: Gunakan Binance Convert API yang benar
+        try:
+            # Menggunakan python-binance library untuk convert
+            result = client.convert_request_quote(
+                fromAsset=from_asset,
+                toAsset='USDT',
+                fromAmount=quantity
+            )
+            
+            if result and 'quoteId' in result:
+                # Accept quote untuk melakukan konversi
+                convert_result = client.convert_accept_quote(quoteId=result['quoteId'])
+                if convert_result:
+                    print(f"✅ CONVERT BERHASIL! {quantity} {from_asset} → USDT")
+                    print(f"📊 Convert result: {convert_result}")
+                    return True
+                    
+        except Exception as e:
+            print(f"⚠️ Convert API gagal: {e}")
+        
+        # Method 2: Coba manual convert menggunakan endpoint alternatif
+        try:
+            import requests
+            import hmac
+            import hashlib
+            import time
+            
+            timestamp = int(time.time() * 1000)
+            
+            # Parameter untuk small amount trade
+            params = {
+                'fromAsset': from_asset,
+                'toAsset': 'USDT', 
+                'fromAmount': str(quantity),
+                'timestamp': timestamp
+            }
+            
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            signature = hmac.new(
+                api_secret.encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+            headers = {'X-MBX-APIKEY': api_key}
+            
+            # Coba endpoint convert yang berbeda
+            endpoints = [
+                'https://api.binance.com/sapi/v1/convert/getQuote',
+                'https://api.binance.com/sapi/v1/asset/dust-btc',  # Dust conversion
+            ]
+            
+            for endpoint in endpoints:
+                try:
+                    response = requests.post(endpoint, params=params, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        print(f"✅ CONVERT BERHASIL via {endpoint}")
+                        print(f"📊 Response: {data}")
+                        return True
+                except:
+                    continue
+                    
+        except Exception as e:
+            print(f"⚠️ Manual convert gagal: {e}")
+        
+        # Method 3: Fallback - Jual dengan quantity yang disesuaikan
+        print(f"🔄 Fallback: Mencoba penjualan dengan adjustment...")
+        symbol = f"{from_asset}USDT"
+        
+        try:
+            # Dapatkan current price dan hitung minimum quantity untuk memenuhi notional
+            current_price = get_current_price(symbol)
+            if current_price > 0:
+                # Coba dengan quantity yang lebih besar untuk memenuhi min notional
+                symbol_filters = get_symbol_filters(symbol)
+                min_notional = symbol_filters.get('minNotional', 1.0)
+                step_size = symbol_filters.get('stepSize', 1.0)
+                
+                # Hitung minimum quantity yang diperlukan
+                min_qty_for_notional = min_notional / current_price
+                
+                # Sesuaikan ke step size
+                adjusted_qty = adjust_quantity_to_lot_size(min_qty_for_notional, step_size)
+                
+                # Jika qty kita lebih kecil dari minimum, coba gunakan minimum
+                if quantity < adjusted_qty:
+                    print(f"📈 Menyesuaikan quantity dari {quantity} ke {adjusted_qty} untuk memenuhi minimum")
+                    # Hanya lakukan jika kita punya cukup balance (dengan tolerance)
+                    if adjusted_qty <= quantity * 1.1:  # 10% tolerance
+                        quantity = adjusted_qty
+                
+                # Coba jual dengan quantity yang sudah disesuaikan
+                final_qty = adjust_quantity_to_lot_size(quantity, step_size)
+                order = client.order_market_sell(symbol=symbol, quantity=final_qty)
+                print(f"✅ PENJUALAN BERHASIL: {order}")
+                return True
+                
+        except BinanceAPIException as e:
+            if "NOTIONAL" in str(e) or "LOT_SIZE" in str(e):
+                print(f"⚠️ Nilai {quantity} {from_asset} terlalu kecil untuk trade normal")
+                print(f"💰 Estimasi nilai: ~{quantity * get_current_price(symbol):.4f} USDT")
+                print(f"💡 Saran: Biarkan tersimpan atau kumpulkan lebih banyak untuk trade berikutnya")
+                return False
+            else:
+                print(f"❌ Error penjualan: {e}")
+                return False
+        
+        print(f"❌ Semua metode convert gagal untuk {quantity} {from_asset}")
+        return False
+        
+    except Exception as e:
+        print(f"❌ Error umum saat convert: {e}")
+        return False
+
 def place_sell_order(symbol, quantity, min_notional):
-    """Menempatkan order jual market."""
+    """Menempatkan order jual market atau convert jika di bawah minimum."""
     try:
         current_price = get_current_price(symbol)
         if current_price == 0:
@@ -182,33 +303,58 @@ def place_sell_order(symbol, quantity, min_notional):
             return False
 
         requested_notional = quantity * current_price
+        coin_asset = symbol.replace('USDT', '')
 
+        print(f"🔍 Analisis penjualan: {quantity} {coin_asset} = {requested_notional:.4f} USDT")
+
+        # Jika nilai kurang dari 1 USDT, langsung convert
+        if requested_notional < 1.0:
+            print(f"💡 Nilai ({requested_notional:.4f} USDT) < 1 USDT → CONVERT")
+            return convert_coin_to_usdt(coin_asset, quantity)
+
+        # Jika di bawah minimum notional, coba convert dulu
         if requested_notional < min_notional:
-            # Jika saldo koin yang tersisa menghasilkan notional di bawah minimum,
-            # Anda tidak akan bisa menjualnya (kecuali untuk beberapa kasus khusus seperti akun kecil).
-            # Dalam skenario ini, kita akan memberitahu pengguna.
-            print(f"Peringatan: Jumlah penjualan ({requested_notional:.2f} USDT) di bawah MIN_NOTIONAL ({min_notional:.2f} USDT).")
-            print("Tidak dapat menjual jumlah ini. Anda mungkin perlu mengumpulkan lebih banyak koin atau mempertimbangkan pasangan perdagangan lain.")
-            return False
+            print(f"⚠️ Di bawah MIN_NOTIONAL ({min_notional:.2f} USDT) → CONVERT")
+            return convert_coin_to_usdt(coin_asset, quantity)
 
+        # Coba penjualan normal
         symbol_filters = get_symbol_filters(symbol)
         step_size = symbol_filters.get('stepSize', 0)
         adjusted_quantity = adjust_quantity_to_lot_size(quantity, step_size)
 
         if adjusted_quantity == 0:
-            print("Kuantitas yang disesuaikan menjadi nol, tidak dapat melakukan penjualan.")
-            return False
+            print(f"❌ Quantity menjadi 0 setelah adjustment → CONVERT")
+            return convert_coin_to_usdt(coin_asset, quantity)
 
-        print(f"Mencoba menjual {adjusted_quantity} {symbol}...")
+        # Periksa kembali setelah adjustment
+        final_notional = adjusted_quantity * current_price
+        if final_notional < min_notional:
+            print(f"❌ Setelah adjustment, notional ({final_notional:.4f}) masih < minimum → CONVERT")
+            return convert_coin_to_usdt(coin_asset, quantity)
+
+        # Coba jual normal
+        print(f"💰 Mencoba jual normal: {adjusted_quantity} {coin_asset} (~{final_notional:.4f} USDT)")
         order = client.order_market_sell(symbol=symbol, quantity=adjusted_quantity)
-        print(f"Order penjualan berhasil: {order}")
+        print(f"✅ PENJUALAN BERHASIL: {order}")
         return True
+        
     except BinanceAPIException as e:
-        print(f"Error saat menjual: {e}")
-        return False
+        error_code = str(e)
+        coin_asset = symbol.replace('USDT', '')
+        
+        print(f"❌ Error penjualan: {e}")
+        
+        if "NOTIONAL" in error_code or "LOT_SIZE" in error_code:
+            print(f"🔄 Filter error → Beralih ke CONVERT")
+            return convert_coin_to_usdt(coin_asset, quantity)
+        else:
+            print(f"❌ Error lain, mencoba convert sebagai fallback...")
+            return convert_coin_to_usdt(coin_asset, quantity)
+            
     except Exception as e:
-        print(f"Terjadi error umum saat menjual: {e}")
-        return False
+        print(f"❌ Error umum: {e}")
+        coin_asset = symbol.replace('USDT', '')
+        return convert_coin_to_usdt(coin_asset, quantity)
 
 # --- Main Logic ---
 def main():
@@ -257,16 +403,33 @@ def main():
         print("\nProgram berhenti...")
         return
 
+    # Variabel untuk kontrol notifikasi
+    last_status_print = 0
+    last_waiting_message = 0
+    last_insufficient_balance_message = 0
+    last_convert_attempt = 0
+    last_sell_failure = 0
+    status_print_interval = 300  # Print status setiap 5 menit
+    message_interval = 60  # Print pesan warning setiap 1 menit
+    convert_attempt_interval = 300  # Coba convert setiap 5 menit
+    sell_failure_interval = 120  # Print sell failure setiap 2 menit
+    
     while True:
         try:
+            current_time = time.time()
             usdt_balance = get_balance('USDT')
             coin_balance = get_balance(coin_asset)
             current_price = get_current_price(symbol)
 
-            print(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-            print(f"[Info] Saldo USDT: {usdt_balance:.4f} | Saldo {coin_asset}: {coin_balance:.4f} | Harga {symbol} saat ini: {current_price:.4f}")
-            if buy_price > 0:
-                print(f"[Info] Harga Beli: {buy_price:.4f} | Stop Loss: {stop_loss:.4f} | Take Profit: {take_profit:.4f}")
+            # Print status setiap 5 menit
+            if current_time - last_status_print >= status_print_interval:
+                print(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+                print(f"[Info] Saldo USDT: {usdt_balance:.4f} | Saldo {coin_asset}: {coin_balance:.4f} | Harga {symbol} saat ini: {current_price:.4f}")
+                if buy_price > 0:
+                    print(f"[Info] Harga Beli: {buy_price:.4f} | Stop Loss: {stop_loss:.4f} | Take Profit: {take_profit:.4f}")
+                    profit_loss_percent = ((current_price - buy_price) / buy_price) * 100
+                    print(f"[Info] P&L: {profit_loss_percent:+.2f}%")
+                last_status_print = current_time
 
             # Logic Auto Buy
             if auto_buy and current_price > 0:
@@ -290,52 +453,84 @@ def main():
                         adjusted_quantity_to_buy = adjust_quantity_to_lot_size(min_notional_value / current_price + coin_step_size, coin_step_size) # Tambah step_size untuk memastikan pembulatan ke atas
 
                     if usdt_balance >= adjusted_quantity_to_buy * current_price * 1.001 and adjusted_quantity_to_buy > 0:
-                        print(f"Membeli koin sejumlah {adjusted_quantity_to_buy} {coin_asset} (estimasi {adjusted_quantity_to_buy * current_price:.2f} USDT)...")
+                        print(f"\n🟢 MEMBELI: {adjusted_quantity_to_buy} {coin_asset} (estimasi {adjusted_quantity_to_buy * current_price:.2f} USDT)")
                         new_buy_price = place_buy_order(symbol, adjusted_quantity_to_buy, min_notional_value)
                         if new_buy_price > 0:
                             buy_price = new_buy_price
                             stop_loss = buy_price * (1 - stop_loss_percent)
                             take_profit = buy_price * (1 + take_profit_percent)
-                            print(f"Pembelian berhasil! Harga beli rata-rata: {buy_price:.4f}")
-                            print(f"Stop Loss di: {stop_loss:.4f}")
-                            print(f"Take Profit di: {take_profit:.4f}")
+                            print(f"✅ PEMBELIAN BERHASIL!")
+                            print(f"💰 Harga beli rata-rata: {buy_price:.4f}")
+                            print(f"🔻 Stop Loss: {stop_loss:.4f}")
+                            print(f"🔺 Take Profit: {take_profit:.4f}")
                         else:
-                            print("Gagal melakukan pembelian. Mungkin saldo tidak cukup atau ada batasan minimum.")
+                            print("❌ Gagal melakukan pembelian.")
                     else:
-                        print(f"Saldo USDT tidak cukup ({usdt_balance:.2f}) untuk membeli target {adjusted_quantity_to_buy:.4f} {coin_asset} seharga {adjusted_quantity_to_buy * current_price:.2f} USDT.")
-                else:
-                    print(f"Sudah memiliki cukup {coin_asset} ({coin_balance:.4f}) mendekati target pembelian ({adjusted_target_quantity:.4f}). Tidak melakukan pembelian.")
-            elif auto_buy and current_price == 0:
-                print("Harga saat ini belum didapatkan, tidak dapat melakukan pembelian otomatis.")
+                        # Print pesan insufficient balance hanya setiap 1 menit
+                        if current_time - last_insufficient_balance_message >= message_interval:
+                            print(f"⚠️ Saldo USDT tidak cukup: {usdt_balance:.2f} USDT (dibutuhkan: {adjusted_quantity_to_buy * current_price:.2f} USDT)")
+                            last_insufficient_balance_message = current_time
 
-            # Logic Auto Sell
+            # Logic Auto Sell - PRIORITAS UTAMA
             if coin_balance > 0:
                 if buy_price == 0 and current_price > 0:
                     buy_price = current_price
                     stop_loss = buy_price * (1 - stop_loss_percent)
                     take_profit = buy_price * (1 + take_profit_percent)
-                    print(f"Menginisialisasi harga acuan penjualan: {buy_price:.4f}")
-                    print(f"Stop Loss: {stop_loss:.4f} | Take Profit: {take_profit:.4f}")
+                    print(f"📊 Inisialisasi harga acuan: {buy_price:.4f}")
+                    print(f"🔻 Stop Loss: {stop_loss:.4f} | 🔺 Take Profit: {take_profit:.4f}")
                 elif buy_price > 0 and current_price > 0:
+                    # CEK STOP LOSS - JUAL SEGERA
                     if current_price <= stop_loss:
-                        print(f"Stop loss tercapai ({current_price:.4f} <= {stop_loss:.4f}). Menjual seluruh {coin_asset}...")
+                        # Print info stop loss tercapai hanya sekali atau setiap interval tertentu
+                        if current_time - last_sell_failure >= sell_failure_interval:
+                            print(f"\n🔴 STOP LOSS TERCAPAI!")
+                            print(f"📉 Harga: {current_price:.4f} <= {stop_loss:.4f}")
+                            print(f"🚨 MENJUAL SELURUH {coin_asset}...")
+                        
                         if place_sell_order(symbol, coin_balance, min_notional_value):
+                            loss_percent = ((current_price - buy_price) / buy_price) * 100
+                            print(f"✅ PENJUALAN BERHASIL!")
+                            print(f"📊 Loss: {loss_percent:.2f}%")
                             buy_price = 0
+                            stop_loss = 0
+                            take_profit = 0
+                            last_sell_failure = 0  # Reset counter
+                        else:
+                            # Hanya print pesan gagal setiap interval tertentu
+                            if current_time - last_sell_failure >= sell_failure_interval:
+                                print("❌ Gagal menjual! Akan coba lagi...")
+                                last_sell_failure = current_time
+                                
+                    # CEK TAKE PROFIT - JUAL SEGERA
                     elif current_price >= take_profit:
-                        print(f"Take profit tercapai ({current_price:.4f} >= {take_profit:.4f}). Menjual seluruh {coin_asset}...")
+                        # Print info take profit tercapai hanya sekali atau setiap interval tertentu
+                        if current_time - last_sell_failure >= sell_failure_interval:
+                            print(f"\n🟢 TAKE PROFIT TERCAPAI!")
+                            print(f"📈 Harga: {current_price:.4f} >= {take_profit:.4f}")
+                            print(f"💰 MENJUAL SELURUH {coin_asset}...")
+                        
                         if place_sell_order(symbol, coin_balance, min_notional_value):
+                            profit_percent = ((current_price - buy_price) / buy_price) * 100
+                            print(f"✅ PENJUALAN BERHASIL!")
+                            print(f"📊 Profit: {profit_percent:.2f}%")
                             buy_price = 0
-                    else:
-                        print(f"Menunggu kondisi jual: Harga saat ini ({current_price:.4f}) berada di antara SL ({stop_loss:.4f}) dan TP ({take_profit:.4f}).")
-                elif current_price == 0:
-                    print("Harga saat ini belum didapatkan, tidak dapat mengevaluasi kondisi jual.")
+                            stop_loss = 0
+                            take_profit = 0
+                            last_sell_failure = 0  # Reset counter
+                        else:
+                            # Hanya print pesan gagal setiap interval tertentu
+                            if current_time - last_sell_failure >= sell_failure_interval:
+                                print("❌ Gagal menjual! Akan coba lagi...")
+                                last_sell_failure = current_time
             else:
                 if not auto_buy:
-                    print(f"Tidak ada {coin_asset} di saldo Anda. Tidak ada yang bisa dijual.")
-                else:
-                    print(f"Saldo {coin_asset} nol dan bot dalam mode auto buy. Menunggu pembelian.")
+                    # Print pesan hanya setiap 1 menit
+                    if current_time - last_waiting_message >= message_interval:
+                        print(f"⏳ Menunggu: Tidak ada {coin_asset} untuk dijual")
+                        last_waiting_message = current_time
 
-            time.sleep(30)
+            time.sleep(10)  # Kurangi interval check untuk respons sell yang lebih cepat
 
         except BinanceAPIException as e:
             print(f"Error Binance API: {e}")

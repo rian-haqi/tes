@@ -9,3 +9,7 @@ six==1.16.0
 ujson==5.8.0
 websockets==11.0.3
 binance
+requests
+urllib3
+requests
+urllib3
